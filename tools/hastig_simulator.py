@@ -6,7 +6,7 @@ Replays real conductivity measurements from NVE gauging CSV files over MQTT,
 using the same hastigNode/<id>/cmd|data|status protocol as the H7-1 hardware.
 
 Run from the repo root:
-  python H71/hastig_simulator.py --csv-file AE35_Tests/Datasets/<file>.csv
+  python tools/hastig_simulator.py --csv-file tools/datasets/<file>.csv
 
 Or let it auto-discover the first CSV in the default datasets directory.
 """
@@ -1020,7 +1020,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--nodes", type=int, default=1, help="Number of virtual nodes to simulate in parallel")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_csv_dir = os.path.normpath(os.path.join(script_dir, "..", "..", "..", "AE35_Tests", "Datasets"))
+    default_csv_dir = os.path.join(script_dir, "datasets")
     p.add_argument("--csv-dir", default=default_csv_dir, help="Directory to auto-discover CSV files from")
     p.add_argument("--csv-file", default=None, help="Path to a gauging CSV file (overrides --csv-dir)")
     p.add_argument("--channel", choices=["Q", "R"], default="Q", help="Which sensor channel to replay (Q=first, R=second)")
