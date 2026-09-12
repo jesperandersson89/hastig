@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
 """
-Hastig single-file MQTT simulator.
+Hastig single-file MQTT simulator — CSV replay edition.
 
-Implements the core runtime behavior of the embedded node:
-- MQTT topics and payload shapes compatible with Hastig-H7-1
-- Command handling (/cmd) and config patching (/cfg)
-- aware/sampling/hibernating state transitions
-- fake sensor data + aggregation
+Replays real conductivity measurements from NVE gauging CSV files over MQTT,
+using the same hastigNode/<id>/cmd|data|status protocol as the H7-1 hardware.
 
-This version can host multiple virtual nodes in parallel over one MQTT connection.
+Run from the repo root:
+  python H71/hastig_simulator.py --csv-file AE35_Tests/Datasets/<file>.csv
+
+Or let it auto-discover the first CSV in the default datasets directory.
 """
 
 import argparse
+import csv
+import glob
 import json
 import math
 import os
-import queue
-import random
 import signal
 import sys
-import threading
 import time
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import paho.mqtt.client as mqtt
@@ -35,18 +34,14 @@ MIN_SAMPLE_PERIOD_MS = 200
 MAX_CONFIG_PAYLOAD_BYTES = 320
 CONFIG_CHUNK_TOTAL = 5
 
+# Assumed cadence the CSV files were originally recorded at (1 row/field-second).
+# Reported sample timestamps use this virtual clock instead of real wall-clock time,
+# so replay can run faster than real-time while still producing physically correct results.
+CSV_ROW_INTERVAL_MS = 1000
+
 MODE_AWARE = "aware"
 MODE_SAMPLING = "sampling"
 MODE_HIBERNATING = "hibernating"
-
-COND_MODE_CONSTANT = "constant"
-COND_MODE_BELL = "bell"
-COND_NOISE_RATIO = 0.02
-
-try:
-    import msvcrt
-except ImportError:
-    msvcrt = None
 
 
 def now_ms() -> int:
@@ -137,7 +132,9 @@ class AppSettings:
     emergency_delay_s: int = 60
     emergency_sleep_s: int = 43200
     max_forced_sleep_s: int = 43200
-    max_unacked_packets: int = 10
+    # bumped from the hardware default of 10: replay now sends one packet per CSV row
+    # instead of one per real second, so the unacked buffer needs more headroom
+    max_unacked_packets: int = 50
 
     def clamp_runtime(self) -> None:
         if self.sample_period_ms < MIN_SAMPLE_PERIOD_MS:
@@ -182,10 +179,7 @@ class VirtualNode:
         node_index: int,
         name_prefix: str,
         topic_prefix: str,
-        cond_baseline: float,
-        cond_amplitude: float,
-        cond_duration_min: float,
-        fixed_temp: float,
+        csv_data: List[Tuple[float, float]],
         publish_fn,
         verbose: bool,
     ) -> None:
@@ -204,12 +198,11 @@ class VirtualNode:
         self.settings.device_name = ""
         self.settings.clamp_runtime()
 
-        self.cond_baseline = max(0.0, cond_baseline)
-        self.cond_amplitude = max(0.0, cond_amplitude)
-        self.cond_duration_ms = max(1.0, cond_duration_min * 60.0 * 1000.0)
-        self.fixed_temp = fixed_temp
-        self.cond_mode = COND_MODE_CONSTANT
-        self.cond_bell_start_ms: Optional[int] = None
+        # CSV replay state
+        self.csv_data: List[Tuple[float, float]] = csv_data  # (cond, temp)
+        self.csv_index: int = 0
+        self._progress_log_interval: int = 10  # log every N samples
+        self.virtual_field_ms: int = 0  # fake, CSV-cadence based timestamp (decoupled from wall clock)
 
         self.boot_ms = now_ms()
         self.session_start_ms = self.boot_ms
@@ -253,32 +246,6 @@ class VirtualNode:
 
     def publish_json(self, topic: str, payload: Dict[str, Any]) -> None:
         self._publish_fn(topic, payload)
-
-    def cond_mode_description(self) -> str:
-        if self.cond_mode == COND_MODE_CONSTANT:
-            return f"{COND_MODE_CONSTANT} baseline={self.cond_baseline:.3f} noise={COND_NOISE_RATIO * 100.0:.1f}%"
-        peak = self.cond_baseline + self.cond_amplitude
-        return (
-            f"{COND_MODE_BELL} baseline={self.cond_baseline:.3f} "
-            f"peak={peak:.3f} duration_min={self.cond_duration_ms / 60000.0:.3f}"
-        )
-
-    def set_cond_mode(self, mode: str, wall_ms: Optional[int] = None) -> None:
-        if wall_ms is None:
-            wall_ms = now_ms()
-
-        if mode == COND_MODE_BELL:
-            self.cond_mode = COND_MODE_BELL
-            self.cond_bell_start_ms = wall_ms
-        else:
-            self.cond_mode = COND_MODE_CONSTANT
-            self.cond_bell_start_ms = None
-
-        self.log(f"conductivity mode -> {self.cond_mode_description()}")
-
-    def toggle_cond_mode(self, wall_ms: Optional[int] = None) -> None:
-        next_mode = COND_MODE_BELL if self.cond_mode == COND_MODE_CONSTANT else COND_MODE_CONSTANT
-        self.set_cond_mode(next_mode, wall_ms)
 
     def publish_status(self, mode: str, extra: Optional[Dict[str, Any]] = None) -> None:
         doc: Dict[str, Any] = {
@@ -351,6 +318,10 @@ class VirtualNode:
             self.last_ack_ms = now_ms()
             self.reset_aggregate_window(now_ms())
             self.next_sample_ms = now_ms()
+            self.csv_index = 0
+            self.virtual_field_ms = 0
+            total = len(self.csv_data)
+            self.log(f"[CSV] Starting playback: {total} samples  session={self.server_session_id or 'none'}")
             if changed:
                 self.publish_mode_change(MODE_SAMPLING, previous)
             self.log(f"mode -> sampling (from {previous})")
@@ -384,31 +355,29 @@ class VirtualNode:
         self.agg_v1_min = 1e30
         self.agg_v1_max = -1e30
 
-    def fake_sensor_sample(self, wall_ms: int) -> Dict[str, Any]:
-        t_rel = self.rel_ms(wall_ms)
-        if self.cond_mode == COND_MODE_CONSTANT:
-            noise = self.cond_baseline * COND_NOISE_RATIO * random.uniform(-1.0, 1.0)
-            cond = max(0.0, self.cond_baseline + noise)
-        elif self.cond_bell_start_ms is not None:
-            elapsed_ms = max(0.0, float(wall_ms - self.cond_bell_start_ms))
-            if elapsed_ms < self.cond_duration_ms:
-                # Raised cosine: baseline -> peak -> baseline over one shot.
-                phase = 2.0 * math.pi * (elapsed_ms / self.cond_duration_ms)
-                cond = self.cond_baseline + (self.cond_amplitude * 0.5 * (1.0 - math.cos(phase)))
-            else:
-                cond = self.cond_baseline
-        else:
-            cond = self.cond_baseline
+    def csv_sensor_sample(self, wall_ms: int) -> Dict[str, Any]:
+        # reported timestamp uses the virtual field clock, not real elapsed wall-clock time,
+        # so replay speed is decoupled from the physical dilution-time math on the backend
+        t_rel = self.virtual_field_ms
+        self.virtual_field_ms += CSV_ROW_INTERVAL_MS
+        total = len(self.csv_data)
 
-        temp = self.fixed_temp
-        return {
-            "relMs": t_rel,
-            "k0": "cond",
-            "v0": float(cond),
-            "k1": "temp",
-            "v1": float(temp),
-            "ok": True,
-        }
+        if total == 0:
+            return {"relMs": t_rel, "k0": "cond", "v0": 0.0, "k1": "temp", "v1": 0.0, "ok": False}
+
+        if self.csv_index < total:
+            cond, temp = self.csv_data[self.csv_index]
+            self.csv_index += 1
+            if self.csv_index == total:
+                self.log(f"[CSV] Data exhausted after {total} samples — holding last value")
+        else:
+            # hold last value; gives a flat plateau for curve-end detection
+            cond, temp = self.csv_data[-1]
+
+        if self._verbose and self.csv_index % self._progress_log_interval == 0 and self.csv_index <= total:
+            self.log(f"[CSV] sample {self.csv_index}/{total}  cond={cond:.2f}  temp={temp:.1f}")
+
+        return {"relMs": t_rel, "k0": "cond", "v0": float(cond), "k1": "temp", "v1": float(temp), "ok": True}
 
     def add_sample(self, sample: Dict[str, Any]) -> None:
         if self.agg_n == 0:
@@ -710,6 +679,10 @@ class VirtualNode:
             self.enter_state(MODE_AWARE)
             return
 
+        if cmd_type == "standby":
+            self.enter_state(MODE_AWARE)
+            return
+
         if cmd_type == "getConfig":
             self.publish_config_snapshot()
             return
@@ -761,14 +734,16 @@ class VirtualNode:
         if self.state != MODE_SAMPLING:
             return
 
+        # every CSV row is emitted as its own aggregate (n=1), stamped with the virtual
+        # field clock — preserves the sample density and per-row timing that curve
+        # detection and flow-rate math expect, independent of real replay speed.
+        # agg_period_s is intentionally not used here for CSV replay.
         sample_period_ms = max(self.settings.sample_period_ms, MIN_SAMPLE_PERIOD_MS)
         while wall_ms >= self.next_sample_ms:
-            sample = self.fake_sensor_sample(self.next_sample_ms)
+            sample = self.csv_sensor_sample(self.next_sample_ms)
             self.add_sample(sample)
             self.next_sample_ms += sample_period_ms
 
-        agg_window_ms = int(self.settings.agg_period_s * 1000)
-        if (wall_ms - self.agg_window_start_wall_ms) >= agg_window_ms:
             aggregate_payload = self.emit_aggregate_payload()
             if aggregate_payload is not None:
                 self.publish_json(self.topic_data, aggregate_payload)
@@ -791,8 +766,6 @@ class Simulator:
         self.running = True
         self.connected = False
         self.next_reconnect_ms = 0
-        self.console_keys: "queue.SimpleQueue[str]" = queue.SimpleQueue()
-        self.console_thread: Optional[threading.Thread] = None
 
         try:
             self.client = mqtt.Client(
@@ -813,16 +786,18 @@ class Simulator:
         self.client.on_disconnect = self.on_disconnect
         self.client.on_message = self.on_message
 
+        csv_q, csv_r = load_csv_data(args.csv_file)
+        self.log(f"[CSV] Loaded {len(csv_q)} rows (Q) and {len(csv_r)} rows (R) from {args.csv_file}")
+
         self.nodes: Dict[str, VirtualNode] = {}
         for i in range(1, args.nodes + 1):
+            # alternate channels across nodes when multiple nodes are requested
+            channel_data = csv_r if (i % 2 == 0 and args.channel == "Q" and len(csv_r) > 0) else (csv_q if args.channel == "Q" else csv_r)
             node = VirtualNode(
                 node_index=i,
                 name_prefix=args.name_prefix,
                 topic_prefix=args.topic_prefix,
-                cond_baseline=args.cond_baseline,
-                cond_amplitude=args.cond_amplitude,
-                cond_duration_min=args.cond_duration_min,
-                fixed_temp=args.temperature,
+                csv_data=channel_data,
                 publish_fn=self.publish_json,
                 verbose=args.verbose,
             )
@@ -861,54 +836,6 @@ class Simulator:
     def stop(self, *_args: Any) -> None:
         self.running = False
 
-    def start_console_listener(self) -> None:
-        if msvcrt is None:
-            self.log("Console key listener disabled: this platform does not support msvcrt")
-            return
-        if self.console_thread is not None:
-            return
-
-        self.console_thread = threading.Thread(target=self._console_key_reader, name="console-key-reader", daemon=True)
-        self.console_thread.start()
-
-    def _console_key_reader(self) -> None:
-        while self.running:
-            try:
-                ch = msvcrt.getwch()
-            except OSError:
-                break
-
-            if not self.running:
-                break
-            if ch in ("\x00", "\xe0"):
-                try:
-                    msvcrt.getwch()
-                except OSError:
-                    break
-                continue
-
-            self.console_keys.put(ch.lower())
-
-    def handle_console_keys(self) -> None:
-        while True:
-            try:
-                key = self.console_keys.get_nowait()
-            except queue.Empty:
-                return
-
-            if key == "q":
-                self.log("Console command: quit requested")
-                self.stop()
-                return
-
-            if key == "t":
-                wall_ms = now_ms()
-                for node in self.nodes.values():
-                    node.toggle_cond_mode(wall_ms)
-                first_node = next(iter(self.nodes.values()), None)
-                if first_node is not None:
-                    self.log(f"Console command: toggled conductivity mode -> {first_node.cond_mode_description()}")
-
     def publish_json(self, topic: str, payload: Dict[str, Any]) -> None:
         raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
         self._log_mqtt_tx(topic, raw)
@@ -938,7 +865,8 @@ class Simulator:
         reason_code: Any = 0,
         _properties: Any = None,
     ) -> None:
-        if (reason_code is None or int(reason_code) == 0) and isinstance(_disconnect_flags, (int, str)):
+        # ReasonCode (VERSION2 API) supports == against int/str but not int(), unlike a plain int rc.
+        if (reason_code is None or reason_code == 0) and isinstance(_disconnect_flags, (int, str)):
             reason_code = _disconnect_flags
 
         # During controlled shutdown we expect disconnect callback.
@@ -992,20 +920,18 @@ class Simulator:
 
     def run(self) -> int:
         self.connect()
-        self.start_console_listener()
         node_ids = list(self.nodes.keys())
         first_id = node_ids[0] if node_ids else "-"
         last_id = node_ids[-1] if node_ids else "-"
-        self.log(
-            f"Simulator started: nodes={self.args.nodes} "
-            f"id_range={first_id}..{last_id} "
-            f"name_prefix={self.args.name_prefix!r} "
-            f"cond_baseline={self.args.cond_baseline} "
-            f"cond_amp={self.args.cond_amplitude} "
-            f"cond_duration_min={self.args.cond_duration_min} "
-            f"temp={self.args.temperature}"
-        )
-        self.log("Console controls: press 't' to toggle conductivity mode, 'q' to quit")
+        csv_rows = len(next(iter(self.nodes.values())).csv_data) if self.nodes else 0
+        print("=" * 60)
+        print("  HASTIG Simulator — CSV Replay")
+        print(f"  Broker  : {self.args.broker}:{self.args.port}")
+        print(f"  Nodes   : {self.args.nodes}  ({first_id} .. {last_id})")
+        print(f"  CSV     : {self.args.csv_file}  ({csv_rows} samples)")
+        print(f"  Channel : {self.args.channel}  |  prefix: {self.args.topic_prefix}")
+        print("  Waiting for startSampling command from the API ...")
+        print("=" * 60)
 
         while self.running:
             rc = self.client.loop(timeout=0.01)
@@ -1013,8 +939,6 @@ class Simulator:
                 self.try_reconnect()
             elif rc != mqtt.MQTT_ERR_SUCCESS and self.args.verbose:
                 self.log(f"loop rc={rc}")
-
-            self.handle_console_keys()
 
             tick_ms = now_ms()
             for node in self.nodes.values():
@@ -1027,6 +951,50 @@ class Simulator:
         except Exception:
             pass
         return 0
+
+
+def load_csv_data(filepath: str) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    """Return (channel_q, channel_r) as lists of (cond, temp) tuples from a gauging CSV."""
+    q_data: List[Tuple[float, float]] = []
+    r_data: List[Tuple[float, float]] = []
+
+    with open(filepath, encoding="utf-8-sig", errors="replace") as f:
+        lines = f.readlines()
+
+    in_timeseries = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("Date/Time"):
+            in_timeseries = True
+            continue
+        if not in_timeseries:
+            continue
+
+        parts = stripped.split(";")
+        # Date/Time ; Meas Point ; Cond.Q ; Cond.R ; Temp.Q ; Temp.R
+        if len(parts) < 5:
+            continue
+        try:
+            cond_q = float(parts[2].replace(",", "."))
+            cond_r = float(parts[3].replace(",", ".")) if len(parts) > 3 and parts[3].strip() else cond_q
+            temp_q = float(parts[4].replace(",", ".")) if parts[4].strip() else 10.0
+            temp_r = float(parts[5].replace(",", ".")) if len(parts) > 5 and parts[5].strip() else temp_q
+            q_data.append((cond_q, temp_q))
+            r_data.append((cond_r, temp_r))
+        except (ValueError, IndexError):
+            continue
+
+    return q_data, r_data
+
+
+def _find_csv_file(csv_dir: str) -> str:
+    pattern = os.path.join(csv_dir, "*.csv")
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        raise SystemExit(f"No CSV files found in {csv_dir!r}. Pass --csv-file or --csv-dir.")
+    return matches[0]
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1051,32 +1019,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--nodes", type=int, default=1, help="Number of virtual nodes to simulate in parallel")
 
-    p.add_argument(
-        "--cond-baseline",
-        type=float,
-        default=1.0,
-        help="Baseline conductivity used in constant mode and before/after the bell event",
-    )
-    p.add_argument(
-        "--cond-amplitude",
-        type=float,
-        default=1.0,
-        help="Conductivity increase above baseline reached at the bell peak",
-    )
-    p.add_argument(
-        "--cond-duration-min",
-        "--cond-period-min",
-        dest="cond_duration_min",
-        type=float,
-        default=10.0,
-        help="Minutes from bell start until the conductivity returns to baseline",
-    )
-    p.add_argument(
-        "--temperature",
-        type=float,
-        default=17.5,
-        help="Fixed temperature value used for all fake samples",
-    )
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_csv_dir = os.path.normpath(os.path.join(script_dir, "..", "..", "..", "AE35_Tests", "Datasets"))
+    p.add_argument("--csv-dir", default=default_csv_dir, help="Directory to auto-discover CSV files from")
+    p.add_argument("--csv-file", default=None, help="Path to a gauging CSV file (overrides --csv-dir)")
+    p.add_argument("--channel", choices=["Q", "R"], default="Q", help="Which sensor channel to replay (Q=first, R=second)")
 
     p.add_argument("--tick-ms", type=int, default=50, help="Main simulation loop period (ms)")
     p.add_argument("--verbose", action="store_true", help="Verbose logging")
@@ -1087,17 +1034,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def validate_args(args: argparse.Namespace) -> None:
     if args.nodes < 1:
         raise SystemExit("--nodes must be >= 1")
-    if args.cond_baseline < 0.0:
-        raise SystemExit("--cond-baseline must be >= 0")
-    if args.cond_amplitude < 0.0:
-        raise SystemExit("--cond-amplitude must be >= 0")
-    if args.cond_duration_min <= 0.0:
-        raise SystemExit("--cond-duration-min must be > 0")
     if args.tick_ms < 1:
         raise SystemExit("--tick-ms must be >= 1")
     if "/" in args.name_prefix:
         raise SystemExit("--name-prefix must not contain '/'")
-
+    if args.csv_file is None:
+        args.csv_file = _find_csv_file(args.csv_dir)
+    if not os.path.isfile(args.csv_file):
+        raise SystemExit(f"CSV file not found: {args.csv_file}")
 
 def main() -> int:
     parser = build_arg_parser()
